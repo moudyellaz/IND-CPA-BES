@@ -1,0 +1,250 @@
+(* -------------------------------------------------------------------- *)
+require import AllCore Int Real Distr DBool Dexcepted DInterval List FSet SDist DMap.
+require (*--*) ROM DiffieHellman PKE_CPA.
+import StdOrder RealOrder.
+
+(* ---------------- Sane Default Behaviours --------------------------- *)
+pragma +implicits.
+
+(* ---------------------- Let's Get Started --------------------------- *)
+(** Assumption: set DDH *)
+(*** WARNING: DiffieHellman is really out of date ***)
+
+require import Elgamal.
+import DH DDH FDistr.
+
+(* The order of the group *)
+axiom q_ge2 : 2 <= q.
+ 
+(* The type of interger between 0 and 2^k *)
+op k : int.
+axiom k_ge0 : 0 <= k.
+
+axiom k_bound : 2^k <= q < 2^(k+1).
+
+(** Definition of the random oracle *)
+clone import ROM as RO with
+  type in_t  <- group,
+  type out_t <- int,
+  op   dout  <- fun _ => [0 .. 2^(k+1) - 1],
+  type d_in_t <- unit,
+  type d_out_t <- bool.
+import Lazy.
+
+(** Construction: a PKE **)
+type pkey = group * F.t.
+type skey = int.
+type ptxt = group.
+type ctxt = group * group.
+
+clone import PKE_CPA as PKE_BC with
+  type pkey <- pkey,
+  type skey <- skey,
+  type ptxt <- ptxt,
+  type ctxt <- ctxt.
+
+(** Definition of Adversary/CPA in the random oracle model *) 
+
+module type AdversaryRO (H:POracle) = {
+  include Adversary
+}.
+
+module type SchemeRO (H:POracle) = {
+  include Scheme
+}.
+
+(* qH is the maximum number of Call allowed to the adversary *)
+op qH : int.
+axiom qH_ge0 : 0 <= qH.
+clone import ROM_BadCall
+  with op qH <- qH.
+import OnBound.
+
+(* Remark: The Adversary can perform only qH call to the random oracle *)
+module CPA_RO(S : SchemeRO, A : AdversaryRO) = {
+  proc main() : bool = {
+    var r;
+    Bound(LRO).init();
+    r <@ CPA(S(LRO), A(Bound(LRO))).main();
+    return r;
+  }
+}.
+
+(** BroadCoast *)
+
+module (BroadCast : SchemeRO) (H:POracle) = {
+  proc kg() = {
+    var n, i, h, sk, pk;
+    n <$ dt \ pred1 F.zero;  (* The product of the ni for all participants *)
+    i <$ dt;
+    h <- g^(i * n);
+    sk <@ H.o(h);  
+    pk <- (g ^ F.ofint sk, n);
+    return (pk, sk);
+  }
+
+ proc enc(pk:pkey, m:ptxt) = {
+    var c;
+    c <@ ElGamal.enc(pk.`1, m);
+    return c;
+ }
+
+ proc dec(sk:skey, c:ctxt) = {
+   var m;
+   m <@ ElGamal.dec(F.ofint sk, c);
+   return m;
+ }
+
+}.
+
+section.
+
+  declare module A <: AdversaryRO {LRO, Log, Bound}.
+  declare axiom Ac_ll: forall (H<:POracle{A}), islossless H.o => islossless A(H).choose.
+  declare axiom Ag_ll: forall (H<:POracle{A}), islossless H.o => islossless A(H).guess.
+
+  module AdvElGamal (A:AdversaryRO) : PKE.Adversary = {
+    proc choose (pk:Elgamal.pkey) = {
+      var n, r;
+      n <$ dt \ pred1 F.zero;  (* The product of the ni for all participants *)
+      Bound(LRO).init();
+      r <@ A(Bound(LRO)).choose(pk,n);
+      return r;
+    }
+
+    proc guess = A(Bound(LRO)).guess
+
+  }.
+
+  local module (D:Dist) (H:POracle) = { 
+     var n : F.t
+     var i : F.t 
+     var h : group
+
+     proc a1() : group = {
+       n <$ dt \ pred1 F.zero;  (* The product of the ni for all participants *)
+       i <$ dt;
+       h <- g^i;  (* n is not used anymore *)
+       return h;
+     }
+
+     proc a2(sk:int) : bool = { 
+       var pk, m0, m1, c, b, b';
+       pk <- (g ^ F.ofint sk, n);
+       (m0, m1) <@ A(H).choose(pk);
+       b <$ {0,1};
+       c <@ BroadCast(H).enc(pk, b ? m1 : m0);
+       b'<@ A(H).guess(c);
+       return (b' = b);
+     }
+        
+  }.
+
+  (* n is not used anymore *)
+  local lemma l1 &m : Pr[CPA_RO(BroadCast, A).main() @ &m : res] = Pr[G0(D,LRO).main() @ &m : res = true].
+  proof.
+    byequiv (: _ ==> ={res}) => //; last by smt().
+    proc; inline CPA(BroadCast(LRO), A(Bound(LRO))).main D(Bound(LRO)).a1 D(Bound(LRO)).a2 BroadCast(LRO).kg; wp; sim.
+    wp; rnd (fun i => i * n{1}) (fun i => i / n{1}).
+    rnd; inline *; auto => /> n /supp_dexcepted; rewrite /pred1 => /> _ hne; split; move=> *; algebra.
+  qed.
+
+  (* h is taken randomly, it is a bad even *)
+  local lemma l2 &m : Pr[G0(D,LRO).main() @ &m : res = true] <= Pr[G1(D,LRO).main() @ &m : res = true] + Pr[G_bad(D,LRO).main() @ &m : res].
+  proof.
+    apply (ROM_BadCall D _ _ _ &m).
+    + move=> H hH; islossless.
+      apply dexcepted_ll; 1: by apply dt_ll.
+      by rewrite dt1E; smt(q_ge2).
+    + move=> H hH; islossless.
+      + by apply (Ag_ll H _).
+      by apply (Ac_ll H _).       
+    by move=> _; apply dinter_ll; smt (IntOrder.exprn_ege1 k_ge0).
+  qed.
+
+  (* bounding bad *)
+  local lemma l_bad &m : Pr[G_bad(D,LRO).main() @ &m : res] <= qH%r / q%r. 
+  proof.
+    byphoare => //; proc; inline *;wp.
+    swap [5..7] 13; wp.
+    rnd (fun i => i \in map log (elems Log.qs)).
+    conseq (: _ ==> card Log.qs <= qH).
+    + move=> /> qs hcard; split.
+      + have := mu_mem_le_mu1 dt (map log (elems qs)) (1%r/q%r) _; 1: by move=> ?;rewrite dt1E.
+        by rewrite /= size_map -cardE; smt(q_ge2).
+      move=> _ i _ hqs; apply mapP. 
+      by exists (g^i); rewrite -memE hqs /=; algebra.
+    call (: card Log.qs <= qH).
+    (* This should be a lemma of the theory ... *)
+    + proc; sp; if => //.
+      inline Log(LRO).o; auto; call(_: true) => //; auto.
+      rewrite fcardU fcard1; smt(fcard_ge0).
+    auto.
+    call (: card Log.qs <= qH).
+    (* This should be a lemma of the theory ... *)
+    + proc; sp; if => //.
+      inline Log(LRO).o; auto; call(_: true) => //; auto.
+      rewrite fcardU fcard1; smt(fcard_ge0).
+    (* Why do we have a "s" in fcards0 ? *)
+    auto => /> *; smt(fcards0 qH_ge0).
+  qed.
+
+  (* We apply the statistical distance *)
+  local clone import SDist.Dist with 
+     type a <- F.t.
+
+  local module (Ds: GenDist.Distinguisher) = { 
+    proc guess(sk:F.t) = { 
+      var n, pk, m0, m1, c, b, b';
+      Bound(LRO).init();
+      n <$ dt \ pred1 F.zero;
+      pk <- (g ^ sk, n);
+      (m0, m1) <@ A(Bound(LRO)).choose(pk);
+      b <$ {0,1};
+      c <@ BroadCast(Bound(LRO)).enc(pk, b ? m1 : m0);
+      b'<@ A(Bound(LRO)).guess(c);
+      return (b' = b);
+    }
+  }.
+
+  local clone import DMapSampling with 
+    type t1 <- int,
+    type t2 <- F.t.
+
+  local lemma l3 &m : Pr[G1(D,LRO).main() @ &m : res = true] = Pr[Sample(Ds).main(dmap [0..2^(k+1)-1] F.ofint) @ &m : res].
+  proof.
+    byequiv (: _ ==> ={res}) => //; 2: smt().
+    proc; inline *; sim; wp.
+    swap{1} 4 4; rnd => /=.
+    swap{1} 7 -6; wp; rnd{1}; wp.
+    conseq (: ofint y{1} = x{2}) => />.
+    transitivity{2} { x <@ S.map([0..2 ^ (k + 1) - 1], ofint); }
+       (true ==> ofint y{1} = x{2})
+       (d{2} = dmap [0..2 ^ (k + 1) - 1] ofint ==> ={x}) => //.
+    + by inline *; wp; rnd; auto.
+    transitivity*{1} { x <@ S.sample([0..2 ^ (k + 1) - 1], ofint); } => //; 1: smt().
+    + by symmetry; call sample.
+    by inline *; auto.
+  qed.
+
+  local lemma l4 &m : 
+    `| Pr[Sample(Ds).main(dmap [0..2^(k+1)-1] F.ofint) @ &m : res] - Pr[Sample(Ds).main(dt) @ &m : res] | 
+     <= sdist (dmap [0..2^(k+1)-1] F.ofint) dt.
+  proof. apply (adv_sdist Ds &m). qed.
+
+  local lemma l5 &m : Pr[Sample(Ds).main(dt) @ &m : res] = Pr[PKE.CPA(ElGamal, AdvElGamal(A)).main() @ &m : res].
+  proof.
+    byequiv => //; proc; inline *; wp; sim; auto.
+    call(: ={glob Bound, glob Log, glob LRO}); 1: by sim.
+    by auto.
+  qed.
+
+  lemma conclusion &m : 
+    Pr[CPA_RO(BroadCast, A).main() @ &m : res] <= 
+      Pr[PKE.CPA(ElGamal, AdvElGamal(A)).main() @ &m : res] +  qH%r / q%r + sdist (dmap [0..2^(k+1)-1] F.ofint) dt.
+  proof. by move: (l1 &m) (l2 &m) (l_bad &m) (l3 &m) (l4 &m) (l5 &m) => /#. qed.
+ 
+end section.
+
+
+
